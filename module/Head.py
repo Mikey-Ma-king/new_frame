@@ -222,43 +222,26 @@ class SparseConv2d(torch.nn.modules.conv._ConvNd):
 # ===================== 核心模块：AMM =====================
 class AMM(nn.Module):
     """自适应多层掩码模块（Adaptive Multi-Layer Masking）"""
-    def __init__(self, in_channels, feat_channels=256, gumbel_noise=True, threshold=0.5):
+    def __init__(self, in_channels, feat_channels=256, gumbel_noise=True, threshold=0.5, target_ar=0.3):
         super().__init__()
-        self.gumbel_noise = gumbel_noise  # 可修改参数：是否启用Gumbel噪声
-        self.threshold = threshold        # 可修改参数：掩码二值化阈值
-        self.gumbel_module = Gumbel(eps=1e-8)  # 引入Gumbel模块
-        
-        # 3x3卷积生成软掩码
+        self.gumbel_noise = gumbel_noise
+        self.threshold = threshold
+        self.target_ar = target_ar
+        self.gumbel_module = Gumbel(eps=1e-8)
         self.mask_conv = nn.Conv2d(in_channels, 1, kernel_size=3, padding=1, bias=False)
-        # 激活率监督损失（L1 Loss）
         self.ars_loss = nn.L1Loss(reduction='mean')
 
     def forward(self, x, mask_gt=None):
-        """
-        Args:
-            x: 输入特征图 (B, C, H, W)
-            mask_gt: 掩码GT (B, 1, H, W) [训练时传入]
-        Returns:
-            hard_mask: Mask类实例（替代原二值掩码）
-            loss_ars: 激活率监督损失（训练时返回）
-        """
-        # 1. 生成软掩码 S_i (B,1,H,W)
         soft_mask = self.mask_conv(x)
-        
-        # 2. 使用Gumbel-Softmax生成可微分的硬掩码（替换原手动Gumbel噪声）
         hard_mask = self.gumbel_module(
-            soft_mask, 
-            gumbel_temp=1.0,  # 可修改参数：Gumbel温度系数，越小越接近硬阈值
+            soft_mask,
+            gumbel_temp=1.0,
             gumbel_noise=self.gumbel_noise and self.training
         )
-        
-        # 3. 激活率监督损失计算
         loss_ars = torch.tensor(0.0, device=x.device)
-        if self.training and mask_gt is not None:
-            ar_pred = torch.mean(torch.sigmoid(soft_mask), dim=[2,3])  # (B,1) 激活率
-            ar_gt = torch.mean(mask_gt, dim=[2,3])      # (B,1) GT激活率
-            loss_ars = self.ars_loss(ar_pred, ar_gt)
-        
+        if self.training:
+            ar_pred = torch.mean(torch.sigmoid(soft_mask), dim=[2,3])
+            loss_ars = self.ars_loss(ar_pred, torch.full_like(ar_pred, self.target_ar))
         return hard_mask, loss_ars
 
 # ===================== 核心模块：CE-GN =====================
@@ -318,38 +301,21 @@ class CESC(nn.Module):
         self.residual = nn.Identity() if in_channels == out_channels else \
             nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
 
-    def forward(self, x, hard_mask, global_feat=None, pw=None):  # 新增pw参数（用于sparse_gn）
-        """
-        Args:
-            x: 输入特征 (B,C,H,W)
-            hard_mask: AMM 生成的Mask类实例（替代原二值掩码）
-            global_feat: 全局特征 G_i（None 时自动生成）
-            pw: (mean, rstd) 用于sparse_gn的逐点统计特征（可选）
-        Returns:
-            out: 上下文增强稀疏卷积输出
-        """
-        # 1. 生成全局上下文特征 G_i
+    def forward(self, x, hard_mask, global_feat=None, pw=None):
         if global_feat is None:
             global_feat = self.point_conv(x)
-            global_feat = F.adaptive_avg_pool2d(global_feat, 1)  # (B,C,1,1)
-        
-        # 2. 稀疏卷积：使用SparseConv2d替代原普通卷积
+            global_feat = F.adaptive_avg_pool2d(global_feat, 1)
+
         sparse_result = self.sparse_conv(x, hard_mask, pw=pw, gn=self.ce_gn.gn)
-        
-        # 处理sparse_conv的返回值（训练时可能返回元组）
+        mse_loss = torch.tensor(0.0, device=x.device)
         if isinstance(sparse_result, tuple):
             x_sparse, mse_loss = sparse_result
-            # 如果需要使用mse_loss，可以在这里处理
-            # 目前我们只需要特征部分
         else:
             x_sparse = sparse_result
-        
-        # 3. CE-GN 增强
+
         x_cegn = self.ce_gn(x_sparse, global_feat)
-        
-        # 4. 残差连接
         out = x_cegn + self.residual(x)
-        return out
+        return out, mse_loss
 
 # ===================== 核心：CEASCHead（基于 FCOS） =====================
 class CEASC(nn.Module):
@@ -443,156 +409,265 @@ class CEASC(nn.Module):
     def forward_single(self, x, stride, mask_gt=None):
         """单尺度特征前向传播"""
         B, C, H, W = x.shape
-        
-        # 1. AMM 生成掩码（返回Mask类实例）
+
+        # 1. AMM 生成掩码
         hard_mask_cls, loss_amm_cls = self.amm_cls(x, mask_gt)
         hard_mask_reg, loss_amm_reg = self.amm_reg(x, mask_gt)
         loss_amm = (loss_amm_cls + loss_amm_reg) / 2
-        
+
         # 2. 全局上下文特征（共享）
         global_feat = self.cesc_cls.point_conv(x)
         global_feat = F.adaptive_avg_pool2d(global_feat, 1)
-        
+
         # 3. 分类分支
-        cls_feat = self.cesc_cls(x, hard_mask_cls, global_feat)
+        cls_feat, mse_cls = self.cesc_cls(x, hard_mask_cls, global_feat)
         for conv in self.cls_convs:
             cls_feat = conv(cls_feat)
-        cls_score = self.cls_out(cls_feat)  # (B, num_classes, H, W)
-        
+        cls_score = self.cls_out(cls_feat)
+
         # 4. 回归分支
-        reg_feat = self.cesc_reg(x, hard_mask_reg, global_feat)
+        reg_feat, mse_reg = self.cesc_reg(x, hard_mask_reg, global_feat)
         for conv in self.reg_convs:
             reg_feat = conv(reg_feat)
-        bbox_pred = self.reg_out(reg_feat)  # (B,4,H,W) → l/t/r/b
-        centerness = self.centerness_out(reg_feat)  # (B,1,H,W)
-        
-        # 5. 回归值尺度缩放（FCOS 核心）
+        bbox_pred = self.reg_out(reg_feat)
+        centerness = self.centerness_out(reg_feat)
+
+        # 5. 回归值尺度缩放
         bbox_pred = bbox_pred * stride
-        
-        return cls_score, bbox_pred, centerness, loss_amm
+
+        total_aux_loss = loss_amm + mse_cls + mse_reg
+        return cls_score, bbox_pred, centerness, total_aux_loss
 
     def forward(self, feats, mask_gts=None):
         """多尺度特征前向传播 - 接收3个张量的元组输入"""
-        # 确保输入是元组或列表，且包含3个特征图
         if isinstance(feats, (tuple, list)):
             assert len(feats) == 3, f"Expected 3 feature maps, got {len(feats)}"
             feats = list(feats)
         else:
-            # 如果输入是单个张量，复制三次（这种情况不应该发生）
             feats = [feats] * 3
-        
-        # 确保特征数量与步长数匹配
+
         assert len(feats) == len(self.strides), f"特征数 {len(feats)} 与步长数 {len(self.strides)} 不匹配"
-        cls_scores, bbox_preds, centernesses, loss_amms = [], [], [], []
-        
+        cls_scores, bbox_preds, centernesses, total_aux = [], [], [], []
+
         for i, (x, stride) in enumerate(zip(feats, self.strides)):
             mask_gt = mask_gts[i] if (mask_gts is not None and i < len(mask_gts)) else None
-            cls_score, bbox_pred, centerness, loss_amm = self.forward_single(x, stride, mask_gt)
+            cls_score, bbox_pred, centerness, aux = self.forward_single(x, stride, mask_gt)
             cls_scores.append(cls_score)
             bbox_preds.append(bbox_pred)
             centernesses.append(centerness)
-            loss_amms.append(loss_amm)
-        
-        # 训练阶段返回损失，推理阶段返回预测
+            total_aux.append(aux)
+
+        aux_loss_mean = torch.stack(total_aux).mean()
+
         if self.training:
-            return cls_scores, bbox_preds, centernesses, torch.stack(loss_amms).mean()
+            return cls_scores, bbox_preds, centernesses, aux_loss_mean
         else:
-            # 返回预测结果，以便后续inference处理
             return cls_scores, bbox_preds, centernesses
 
-    def inference(self, feats, img_size=(640,640), score_thr=0.3, nms_thr=0.5):  # 可修改参数：score_thr（置信度阈值）、nms_thr（NMS阈值）
-        """推理阶段：生成最终检测框，输出YOLO兼容格式"""
-        cls_scores, bbox_preds, centernesses = self.forward(feats)
-        batch_boxes = []
-        batch_scores = []
-        batch_labels = []
-        
-        # 遍历多尺度特征
-        for i, (cls_score, bbox_pred, centerness, stride) in enumerate(zip(
-            cls_scores, bbox_preds, centernesses, self.strides)):
-            
-            B, _, H, W = cls_score.shape
-            # 生成锚点
-            anchor = generate_anchors_strides([cls_score], [stride], img_size)[0].to(cls_score.device)  # (H*W, 2)
-            
-            # 展平特征：(B, C, H, W) → (B, H*W, C)
-            cls_score = cls_score.permute(0, 2, 3, 1).reshape(B, H*W, self.num_classes)  # (B, H*W, num_classes)
-            bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(B, H*W, 4)  # (B, H*W, 4)
-            centerness = centerness.permute(0, 2, 3, 1).reshape(B, H*W, 1)  # (B, H*W, 1)
-            
-            # 计算置信度（分类得分 * 中心度）
-            cls_score_sigmoid = torch.sigmoid(cls_score)
-            centerness_sigmoid = torch.sigmoid(centerness)
-            scores = cls_score_sigmoid * centerness_sigmoid  # (B, H*W, num_classes)
-            
-            # 遍历每张图
+    def compute_loss(self, cls_scores, bbox_preds, centernesses, aux_loss, gt_bboxes, gt_labels, img_size):
+        """FCOS loss 计算
+        Args:
+            cls_scores: list of [B, num_classes, Hi, Wi]
+            bbox_preds: list of [B, 4, Hi, Wi] — (l, t, r, b) 距离，已乘 stride
+            centernesses: list of [B, 1, Hi, Wi]
+            aux_loss: 辅助损失 (AMM + CESC mse)
+            gt_bboxes: list[Tensor] — 每张图的 GT box [Mi, 4] xywh 归一化格式
+            gt_labels: list[Tensor] — 每张图的 GT 类别 [Mi]
+            img_size: (H, W) 图像尺寸
+        Returns:
+            dict: {"loss_cls": ..., "loss_reg": ..., "loss_ctr": ..., "loss_aux": ...}
+        """
+        B = cls_scores[0].shape[0]
+        INF = 1e8
+        center_radius = self.center_sampling_radius
+
+        loss_cls_total = torch.tensor(0.0, device=cls_scores[0].device)
+        loss_reg_total = torch.tensor(0.0, device=cls_scores[0].device)
+        loss_ctr_total = torch.tensor(0.0, device=cls_scores[0].device)
+        num_pos_total = 0
+
+        for level_idx, (cls_score, bbox_pred, centerness, stride) in enumerate(
+            zip(cls_scores, bbox_preds, centernesses, self.strides)):
+            _, _, H, W = cls_score.shape
+            # 生成锚点网格
+            xs = torch.arange(0, W * stride, stride, dtype=torch.float32, device=cls_score.device) + stride / 2
+            ys = torch.arange(0, H * stride, stride, dtype=torch.float32, device=cls_score.device) + stride / 2
+            yy, xx = torch.meshgrid(ys, xs, indexing='ij')
+            anchor_pts = torch.stack([xx, yy], dim=-1).reshape(-1, 2)  # (N_anchors, 2)
+
+            cls_score_flat = cls_score.permute(0, 2, 3, 1).reshape(B, H * W, self.num_classes)
+            bbox_pred_flat = bbox_pred.permute(0, 2, 3, 1).reshape(B, H * W, 4)
+            centerness_flat = centerness.permute(0, 2, 3, 1).reshape(B, H * W, 1)
+
             for b in range(B):
-                img_boxes = []
-                img_scores = []
-                img_labels = []
-                
-                # 遍历每个类别，单独筛选
+                gt_box = gt_bboxes[b]  # [M, 4] xywh normalized
+                gt_cls = gt_labels[b]  # [M]
+                if gt_box.numel() == 0:
+                    continue
+                M = gt_box.shape[0]
+                # convert normalized xywh → absolute xyxy
+                gw, gh = img_size[1], img_size[0]
+                gt_xyxy = xywh2xyxy(gt_box)
+                gt_xyxy[:, [0, 2]] *= gw
+                gt_xyxy[:, [1, 3]] *= gh
+
+                # 每个 anchor 与所有 GT 的 ltrb 距离
+                anchors = anchor_pts  # (N, 2)
+                l = anchors[:, 0:1] - gt_xyxy[:, 0][None, :]  # (N, M)
+                t = anchors[:, 1:2] - gt_xyxy[:, 1][None, :]
+                r = gt_xyxy[:, 2][None, :] - anchors[:, 0:1]
+                b_dist = gt_xyxy[:, 3][None, :] - anchors[:, 1:2]
+                ltrb = torch.stack([l, t, r, b_dist], dim=-1)  # (N, M, 4)
+
+                # 正样本：anchor 在 GT 框内
+                in_box = (ltrb.min(dim=-1)[0] > 0)  # (N, M)
+                # Center-sampling: anchor 在 GT 中心区域内
+                gt_cx = (gt_xyxy[:, 0] + gt_xyxy[:, 2]) / 2  # (M,)
+                gt_cy = (gt_xyxy[:, 1] + gt_xyxy[:, 3]) / 2
+                c_l = anchors[:, 0:1] - (gt_cx[None, :] - center_radius * stride)
+                c_t = anchors[:, 1:2] - (gt_cy[None, :] - center_radius * stride)
+                c_r = (gt_cx[None, :] + center_radius * stride) - anchors[:, 0:1]
+                c_b = (gt_cy[None, :] + center_radius * stride) - anchors[:, 1:2]
+                in_center = (torch.stack([c_l, c_t, c_r, c_b], dim=-1).min(dim=-1)[0] > 0)  # (N, M)
+
+                positive = in_box & in_center  # (N, M)
+
+                # 每个 anchor 最多匹配一个 GT（面积最小的）
+                areas = (gt_xyxy[:, 2] - gt_xyxy[:, 0]) * (gt_xyxy[:, 3] - gt_xyxy[:, 1])  # (M,)
+                areas_expand = areas[None, :].expand(H * W, M).clone()
+                areas_expand[~positive] = INF
+                min_area, matched_gt = areas_expand.min(dim=1)  # (N,)
+
+                pos_mask = min_area < INF  # (N,)
+                num_pos = pos_mask.sum().item()
+                if num_pos == 0:
+                    continue
+                num_pos_total += num_pos
+
+                pos_idx = pos_mask.nonzero(as_tuple=True)[0]  # (num_pos,)
+                matched = matched_gt[pos_idx]  # (num_pos,)
+
+                # 分类 target：one-hot
+                cls_target = torch.zeros(num_pos, self.num_classes, device=cls_score.device)
+                cls_target[torch.arange(num_pos), gt_cls[matched]] = 1
+                cls_pred = cls_score_flat[b][pos_idx]  # (num_pos, num_classes)
+                loss_cls_total += self.cls_loss(cls_pred, cls_target).sum() / num_pos
+
+                # 回归 target：l*, t*, r*, b*
+                reg_target = ltrb[pos_idx, matched, :]  # (num_pos, 4)
+                reg_pred = bbox_pred_flat[b][pos_idx]  # (num_pos, 4)
+                loss_reg_total += self.reg_loss(reg_pred, reg_target).sum() / num_pos
+
+                # 中心度 target
+                lt = reg_target[:, 0:1]
+                tt = reg_target[:, 1:2]
+                rt = reg_target[:, 2:3]
+                bt = reg_target[:, 3:4]
+                ctr_target = torch.sqrt(
+                    (lt.min(rt) / lt.max(rt).clamp(min=1e-6)) * (tt.min(bt) / tt.max(bt).clamp(min=1e-6))
+                )
+                ctr_pred = centerness_flat[b][pos_idx]
+                loss_ctr_total += self.centerness_loss(ctr_pred, ctr_target).sum() / num_pos
+
+        if num_pos_total > 0:
+            loss_cls_total = loss_cls_total / len(self.strides)
+            loss_reg_total = loss_reg_total / len(self.strides)
+            loss_ctr_total = loss_ctr_total / len(self.strides)
+        else:
+            # 无正样本时只计算分类 loss 的负样本部分
+            for cls_score in cls_scores:
+                B, _, H, W = cls_score.shape
+                cls_flat = cls_score.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+                loss_cls_total += self.cls_loss(cls_flat, torch.zeros_like(cls_flat)).mean()
+            loss_cls_total = loss_cls_total / len(self.strides)
+
+        return {
+            "loss_cls": loss_cls_total,
+            "loss_reg": loss_reg_total,
+            "loss_ctr": loss_ctr_total,
+            "loss_aux": aux_loss,
+        }
+
+    def inference_batch(self, cls_scores, bbox_preds, centernesses, img_shape, score_thr=0.3, nms_thr=0.5):
+        """批量推理：返回 [B, N, 6] YOLO 兼容格式。
+
+        Args:
+            cls_scores, bbox_preds, centernesses: forward 输出的 3 个 list
+            img_shape: (H, W) 输入图像尺寸
+        Returns:
+            torch.Tensor [B, N, 6] — [x1, y1, x2, y2, conf, cls]
+        """
+        B = cls_scores[0].shape[0]
+        batch_results = []
+
+        for b in range(B):
+            img_boxes = []
+            img_scores = []
+            img_labels = []
+
+            for level_idx, (cls_score, bbox_pred, centerness, stride) in enumerate(
+                zip(cls_scores, bbox_preds, centernesses, self.strides)):
+                _, _, H, W = cls_score.shape
+                anchor = generate_anchors_strides([cls_score], [stride], img_shape)[0].to(cls_score.device)
+
+                cls_flat = cls_score[b].permute(1, 2, 0).reshape(H * W, self.num_classes)
+                bbox_flat = bbox_pred[b].permute(1, 2, 0).reshape(H * W, 4)
+                ctr_flat = centerness[b].permute(1, 2, 0).reshape(H * W, 1)
+
+                cls_sigmoid = torch.sigmoid(cls_flat)
+                ctr_sigmoid = torch.sigmoid(ctr_flat)
+                scores = cls_sigmoid * ctr_sigmoid  # (H*W, num_classes)
+
                 for cls_idx in range(self.num_classes):
-                    # 提取当前类别的得分
-                    cls_scores_single = scores[b, :, cls_idx]  # (H*W,)
-                    # 筛选高分锚点
-                    keep_idx = cls_scores_single > score_thr  # (H*W,)
+                    cls_scores_single = scores[:, cls_idx]
+                    keep_idx = cls_scores_single > score_thr
                     if not keep_idx.any():
                         continue
-                    
-                    # 提取有效数据（保证boxes和scores维度匹配）
-                    valid_scores = cls_scores_single[keep_idx]  # (M,)
-                    valid_bbox_pred = bbox_pred[b, keep_idx, :]  # (M, 4)
-                    valid_anchor = anchor[keep_idx, :]  # (M, 2)
-                    
-                    # 从 l/t/r/b 转换为 x1/y1/x2/y2
-                    l, t, r, b_dist = valid_bbox_pred.unbind(-1)
+
+                    valid_scores = cls_scores_single[keep_idx]
+                    valid_bbox = bbox_flat[keep_idx]
+                    valid_anchor = anchor[keep_idx]
+
+                    l, t, r, b_dist = valid_bbox.unbind(-1)
                     x1 = valid_anchor[:, 0] - l
                     y1 = valid_anchor[:, 1] - t
                     x2 = valid_anchor[:, 0] + r
                     y2 = valid_anchor[:, 1] + b_dist
-                    boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # (M, 4)
-                    
-                    # 限制框在图像内
-                    boxes = torch.clamp(boxes, 0, img_size[0]-1)
-                    
-                    # 收集当前类别的结果
+                    boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+                    # 分别限制 x/y 坐标到各自维度范围内
+                    boxes[:, [0, 2]] = torch.clamp(boxes[:, [0, 2]], 0, img_shape[1] - 1)
+                    boxes[:, [1, 3]] = torch.clamp(boxes[:, [1, 3]], 0, img_shape[0] - 1)
+
                     img_boxes.append(boxes)
                     img_scores.append(valid_scores)
                     img_labels.append(torch.full_like(valid_scores, cls_idx, dtype=torch.long))
-                
-                # 合并当前图所有类别的结果
-                if img_boxes:
-                    img_boxes = torch.cat(img_boxes)
-                    img_scores = torch.cat(img_scores)
-                    img_labels = torch.cat(img_labels)
-                    
-                    # 类内NMS
-                    keep = nms(img_boxes, img_scores, nms_thr)
-                    batch_boxes.append(img_boxes[keep])
-                    batch_scores.append(img_scores[keep])
-                    batch_labels.append(img_labels[keep])
-        
-        # 合并所有批次结果
-        if not batch_boxes:
-            # 返回空的YOLO格式张量 [x1, y1, x2, y2, conf, cls]
-            return torch.empty(0, 6, device=feats[0].device, dtype=torch.float32)
-        
-        all_boxes = torch.cat(batch_boxes)
-        all_scores = torch.cat(batch_scores)
-        all_labels = torch.cat(batch_labels)
-        
-        # 最终跨类NMS（可选，根据需求调整）
-        keep = nms(all_boxes, all_scores, nms_thr)
-        
-        # 将结果组织为YOLO格式：[x1, y1, x2, y2, conf, cls]
-        detections = torch.cat([
-            all_boxes[keep],
-            all_scores[keep].unsqueeze(1),
-            all_labels[keep].float().unsqueeze(1)
-        ], dim=1)  # [N, 6] -> [x1,y1,x2,y2,conf,cls]
-        
-        return detections
+
+            if img_boxes:
+                img_boxes = torch.cat(img_boxes)
+                img_scores = torch.cat(img_scores)
+                img_labels = torch.cat(img_labels)
+                keep = nms(img_boxes, img_scores, nms_thr)
+                det = torch.cat([
+                    img_boxes[keep],
+                    img_scores[keep].unsqueeze(1),
+                    img_labels[keep].float().unsqueeze(1)
+                ], dim=1)  # [N, 6]
+            else:
+                det = torch.empty(0, 6, device=cls_scores[0].device, dtype=torch.float32)
+            batch_results.append(det)
+
+        return batch_results if B == 1 else torch.stack(batch_results) if all(
+            r.shape == batch_results[0].shape for r in batch_results
+        ) else batch_results
+
+    def inference(self, feats, img_size=(640, 640), score_thr=0.3, nms_thr=0.5):
+        """单图推理（兼容旧接口），返回 [N, 6]。"""
+        cls_scores, bbox_preds, centernesses = self.forward(feats)
+        results = self.inference_batch(cls_scores, bbox_preds, centernesses,
+                                       img_shape=img_size, score_thr=score_thr, nms_thr=nms_thr)
+        if isinstance(results, list):
+            return results[0] if results else torch.empty(0, 6)
+        return results[0] if results.dim() == 2 else results
 
 # ===================== 测试代码（可直接运行） =====================
 if __name__ == "__main__":
@@ -625,20 +700,18 @@ if __name__ == "__main__":
         torch.tensor([2], dtype=torch.long)
     ]
     # 先调用forward获取cls_scores、bbox_preds、centernesses
-    cls_scores, bbox_preds, centernesses, _ = head.forward(feats)
-    # 计算损失（传入img_size参数）
-    losses = head.compute_loss(cls_scores, bbox_preds, centernesses, gt_bboxes, gt_labels, img_size=(640, 640))
+    cls_scores, bbox_preds, centernesses, aux_loss = head.forward(feats)
+    losses = head.compute_loss(cls_scores, bbox_preds, centernesses, aux_loss,
+                                gt_bboxes, gt_labels, img_size=(640, 640))
     print("训练损失：")
     for k, v in losses.items():
         print(f"  {k}: {v.item():.4f}")
-    
+
     # 4. 推理模式测试
     head.eval()
     with torch.no_grad():
-        boxes, scores, labels = head.inference(feats, img_size=(640,640))
+        detections = head.inference(feats, img_size=(640, 640))
     print("\n推理结果：")
-    print(f"检测框数量：{len(boxes)}")
-    if len(boxes) > 0:
-        print(f"第一个框：{boxes[0].numpy()}")
-        print(f"第一个框得分：{scores[0].item():.4f}")
-        print(f"第一个框类别：{labels[0].item()}")
+    print(f"检测框数量：{len(detections)}")
+    if len(detections) > 0:
+        print(f"第一个框：{detections[0].tolist()}")

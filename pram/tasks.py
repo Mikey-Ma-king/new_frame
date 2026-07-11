@@ -508,40 +508,51 @@ class MyModel(DetectionModel):
 
     自定义模型类,用于加载model_0到model_8的YAML配置文件。
     该类扩展了BaseModel,支持加载特定的模型配置文件，用于目标检测任务。
-    
-    属性:
-        yaml (dict): 模型配置字典。
-        model (torch.nn.Sequential): 神经网络模型。
-        save (list): 需要保存输出的层索引列表。
-        names (dict): 类名字典。
-        inplace (bool): 是否使用就地操作。
-        stride (torch.Tensor): 模型步长值。
-    
-    方法:
-        __init__: 初始化自定义检测模型。
-        init_criterion: 初始化损失准则。
-    
-    示例:
-        >>> model = MyModel("model_0.yaml", ch=3, nc=80)
-        >>> results = model.predict(image_tensor)
     """
-    
-    def __init__(self, cfg="model_0.yaml", ch=3, nc=None, verbose=True):
-        """Wrap Ultralytics' DetectionModel initialization so `MyModel` is fully compatible with
-        Ultralytics trainer while preserving existing YAML-based behavior.
 
-        This delegates construction to `DetectionModel.__init__` which already handles YAML
-        parsing, channel override, stride computation and weight initialization. We keep the
-        class name and location so other code importing `pram.tasks.MyModel` continues to work.
-        """
-        # Delegate to DetectionModel to ensure full compatibility with trainer expectations
+    def __init__(self, cfg="model_0.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-        # preserve explicit task attribute
         self.task = getattr(self, 'task', 'detect')
+
+    def loss(self, batch, preds=None):
+        """CEASC 头走 FCOS loss，非 CEASC 走父类 criterion 逻辑"""
+        m = self.model[-1]
+        if isinstance(m, CEASC):
+            # _predict_once 正确路由跨层连接（BiFPN 的 from 字段等）
+            cls_scores, bbox_preds, centernesses, aux_loss = self.predict(batch["img"])
+
+            # 从 batch 提取 GT
+            gt_bboxes = []
+            gt_labels = []
+            batch_idx = batch.get("batch_idx", None)
+            gt_cls_all = batch["cls"]
+            gt_boxes_all = batch["bboxes"]
+            if batch_idx is not None:
+                for b in range(len(batch["img"])):
+                    mask = batch_idx == b
+                    gt_bboxes.append(gt_boxes_all[mask])
+                    gt_labels.append(gt_cls_all[mask].long())
+            else:
+                gt_bboxes.append(gt_boxes_all)
+                gt_labels.append(gt_cls_all.long())
+
+            img_size = batch["img"].shape[-2:]
+            losses = m.compute_loss(
+                cls_scores, bbox_preds, centernesses,
+                aux_loss, gt_bboxes, gt_labels, img_size
+            )
+            # 构造 Ultralytics 兼容的 loss 输出格式
+            total = losses["loss_cls"] + losses["loss_reg"] + losses["loss_ctr"] + losses["loss_aux"]
+            return total, losses
+        else:
+            if getattr(self, "criterion", None) is None:
+                self.criterion = self.init_criterion()
+            if preds is None:
+                preds = self.forward(batch["img"])
+            return self.criterion(preds, batch)
 
     def init_criterion(self):
         """初始化MyModel的损失准则。"""
-        # 返回检测损失函数实例
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
@@ -1103,13 +1114,14 @@ def parse_model(d, ch, verbose=True):
         # 如果是第一层，清空通道数列表（把初始化的ch里面的输入通道数删掉）
         if i == 0:
             ch = []
-        if m is not BiFPN and m is not CEASC and m is not Sequential_BiFPN:  # BiFPN模块的输出通道数在模块内部定义，不需要添加到通道数列表
-            ch.append(c2)  
-        elif m is BiFPN:  # BiFPN模块的输出通道数在模块内部定义，需要添加到通道数列表
+        _m_name = m.__name__ if hasattr(m, '__name__') else m.__class__.__name__
+        if _m_name not in ('BiFPN', 'CEASC', 'Sequential_BiFPN'):
+            ch.append(c2)
+        elif _m_name == 'BiFPN':
             for _ in range(5):
                 ch.append(c2)
-        else:
-            for _ in range(3):  # 如果模块重复，添加n次输出通道数到通道数列表
+        else:  # CEASC or Sequential_BiFPN → 3 output feature maps
+            for _ in range(3):
                 ch.append(c2)
         # 添加输出通道数到通道数列表
         # ch和c2都是locals里的变量，循环更新

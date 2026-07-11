@@ -7,43 +7,22 @@ from ultralytics.nn.modules import C3k2
 
 
 class space_to_depth(nn.Module):
-    def __init__(self, dimension=1):
-    
+    """空间到深度：将 H×W 上的 2×2 邻域像素展开到通道维度，输出 [B, 4C, H/2, W/2]"""
+
+    def __init__(self):
         super().__init__()
-        self.d = dimension
 
     def forward(self, x):
-        """
-        前向传播函数
-        
-        Args:
-            x (torch.Tensor): 输入张量，形状为 [B, C, H, W]
-            
-        Returns:
-            torch.Tensor: 输出张量，形状为 [B, 4*C, H//2, W//2]
-            
-        实现细节:
-        使用切片操作将输入特征图划分为4个子区域:
-        1. x[..., ::2, ::2]     - 左上角区域 (偶数行, 偶数列)
-        2. x[..., 1::2, ::2]    - 左下角区域 (奇数行, 偶数列)  
-        3. x[..., ::2, 1::2]    - 右上角区域 (偶数行, 奇数列)
-        4. x[..., 1::2, 1::2]   - 右下角区域 (奇数行, 奇数列)
-        
-        然后在通道维度(dim=1)上拼接这4个区域,实现空间到深度的转换
-        ::这个符号是隔两个选一个的意思，例如，从0开始，隔两个就是1，2，最终选到2
-        """
         return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
     
 class SPD(space_to_depth):
-    def __init__(self, dimension=1,scale=2):
-        super().__init__(dimension)
+    """通用 space-to-depth，支持 scale>2。将 H×W 上 scale×scale 邻域展开到通道维度。"""
+
+    def __init__(self, scale=2):
+        super().__init__()
         self.scale = scale
 
     def forward(self, x):
-        # Correct space-to-depth implementation: collect sub-sampled patches
-        # and concatenate along the channel dimension. The previous code used
-        # list.extend on a tensor which iterates over the batch dimension and
-        # explodes memory usage.
         if self.scale == 2:
             return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], dim=1)
         patches = [x[..., i::self.scale, j::self.scale] for i in range(self.scale) for j in range(self.scale)]
@@ -324,8 +303,8 @@ class SCBottleneck(nn.Module):
             nn.BatchNorm2d(out_channels)
         )
 
-        self.pre = nn.Conv2d(in_channels,2*self.c,kernel_size=1,stride=1,bias=False)
-        # 这里有必要认为扩大感受野么？例如把kernal_size设为3
+        self.pre = nn.Conv2d(in_channels, 2 * self.c, kernel_size=1, stride=1, bias=False)
+
     def forward(self, x):
         """
         前向传播
@@ -383,14 +362,12 @@ class SCConv(nn.Module):
             nn.SiLU()
         )
         
-        # k4分支: 输出投影分支
+        # k4: 输出投影，groups=1 保证兼容任意 out_channels
         self.k4 = nn.Sequential(
             nn.Conv2d(mid_channels, out_channels, kernel_size=3, stride=1,
-                     padding=dilation, dilation=dilation,groups = 1,bias=False),
+                     padding=dilation, dilation=dilation, groups=1, bias=False),
             nn.BatchNorm2d(out_channels)
         )
-        # 这里真是扫码了，因为out_channels必须被groups整除，所以groups=1
-        # 我没有办法规定out_channels和groups，也就是in_channels的关系
 
     def forward(self, x):
         """
@@ -435,23 +412,16 @@ class SCConv(nn.Module):
 class SPD_SCConv(SCBottleneck):
 
     def __init__(self, in_channels, out_channels,
-                 pooling_r=4, dilation=1,dimension=1,scale=2,group=1):
-        # 注意，pooling_r和scale参数没有任何关系，但是Upsample和scale有关系
-        super().__init__(in_channels * (scale ** 2), out_channels, 
-                 pooling_r=pooling_r, dilation=dilation,group=group)
-        
-        self.SPD = SPD(dimension,scale)
-        # SPD expands channels by scale^2 (space-to-depth). The Upsample module
-        # receives SPD output, so its in_channels must reflect that expansion.
+                 pooling_r=4, dilation=1, scale=2, group=1):
+        super().__init__(in_channels * (scale ** 2), out_channels,
+                         pooling_r=pooling_r, dilation=dilation, group=group)
+
+        self.SPD = SPD(scale)
         self.Upsample = DySample(in_channels * (scale ** 2), scale, groups=1)
-        # Dysample调用的时候必须满足in_channels%groups==0，要不然就会报错，没有错误纠正机制
-        # 但是这种情况把所有的通道当成了一大坨去处理，可能会导致准确率下降
+
     def forward(self, x):
-
         spd_output = self.SPD(x)
-        
         upsampled_features = self.Upsample(spd_output)
-
         return super().forward(upsampled_features)
     
 class SimAM(torch.nn.Module):
@@ -535,8 +505,6 @@ class SeparableConvBlock(nn.Module):
 
         self.depthwise_conv = Conv2dStaticSamePadding(in_channels, in_channels,
                                                       kernel_size=3, stride=1, groups=in_channels, bias=False)
-        # 这里面的group有待商榷，因为把所有传入通道依次滤波真的好么
-        # 原本的bias默认是True
         self.pointwise_conv = Conv2dStaticSamePadding(in_channels, out_channels, kernel_size=1, stride=1)
 
         self.norm = norm
@@ -901,23 +869,23 @@ class BiFPN(nn.Module):
         
         w2_4 = self.w2_4_relu(self.w2_4)
         weight = w2_4 / (torch.sum(w2_4, dim=0) + self.epsilon)
-        l4_out = self.conv4_down(
+        l4_out = self.conv_4_down(
             self.swish(weight[0] * l4_in + weight[1] * l4_up + weight[2] * self.downsample_4(l2_out)))
 
         w2_6 = self.w2_6_relu(self.w2_6)
         weight = w2_6 / (torch.sum(w2_6, dim=0) + self.epsilon)
-        l6_out = self.conv6_down(
+        l6_out = self.conv_6_down(
             self.swish(weight[0] * l6_in + weight[1] * l6_up + weight[2] * self.downsample_6(l4_out)))
 
         w2_8 = self.w2_8_relu(self.w2_8)
         weight = w2_8 / (torch.sum(w2_8, dim=0) + self.epsilon)
-        l8_out = self.conv8_down(
+        l8_out = self.conv_8_down(
             self.swish(weight[0] * l8_in + weight[1] * l8_up + weight[2] * self.downsample_8(l6_out)))
 
 
         w2_10 = self.w2_10_relu(self.w2_10)
         weight = w2_10 / (torch.sum(w2_10, dim=0) + self.epsilon)
-        l10_out = self.conv10_down(
+        l10_out = self.conv_10_down(
             self.swish(weight[0] * l10_in + weight[1] * self.downsample_10(l8_out)))
 
 
@@ -946,77 +914,62 @@ class BiFPN(nn.Module):
 
         l2_out = self.conv_2_up(self.swish( l2_in +  self.upsample_2(l4_up)))
 
-        l4_out = self.conv4_down(
+        l4_out = self.conv_4_down(
             self.swish(l4_in + l4_up + self.downsample_4(l2_out)))
 
-        l6_out = self.conv6_down(
+        l6_out = self.conv_6_down(
             self.swish(l6_in + l6_up + self.downsample_6(l4_out)))
 
-        l8_out = self.conv8_down(
+        l8_out = self.conv_8_down(
             self.swish(l8_in +  l8_up + self.downsample_8(l6_out)))
 
 
-        l10_out = self.conv10_down(
+        l10_out = self.conv_10_down(
             self.swish(l10_in + self.downsample_10(l8_out)))
 
         return l2_out, l4_out, l6_out, l8_out, l10_out
 
 
 class Sequential_BiFPN(nn.Module):
-    """
-    顺序处理的BiFPN模块
-    该模块将多个BiFPN层按顺序堆叠,形成深层特征融合网络
-    每个BiFPN层都会接收前一层的输出作为输入,实现渐进式的特征融合
-    """
+    """顺序处理的BiFPN模块，将多个BiFPN层按顺序堆叠形成深层特征融合网络。"""
 
-    def __init__(self, num_channels: int, num_layers: int = 2, conv_channels: tuple = (), epsilon=1e-4, 
-                 onnx_export=False, attention=False):
-        """
-        初始化顺序BiFPN模块
+    def __init__(self, num_channels: int, num_layers: int = 2, conv_channels: tuple = (),
+                 epsilon=1e-4, onnx_export=False, attention=False,
+                 output_layers=None):
+        """初始化顺序BiFPN模块。
 
         Args:
-            num_channels (int): 特征通道数
-            num_layers (int): BiFPN层数量
-            conv_channels (tuple): 输入特征通道数元组
-            epsilon (float): 权重归一化的小数值，防止除零错误
-            onnx_export (bool): 是否为ONNX导出优化
-            attention (bool): 是否使用注意力权重
+            num_channels: 特征通道数
+            num_layers: BiFPN层数量
+            conv_channels: 输入特征通道数元组
+            epsilon: 权重归一化的小数值
+            onnx_export: 是否为ONNX导出优化
+            attention: 是否使用注意力权重
+            output_layers: 输出层索引元组，None 时使用默认 3 输出融合 (P3/P4/P5)
         """
         super(Sequential_BiFPN, self).__init__()
-        
-        # 创建多个BiFPN层，每个层共享相同的配置
+
         self.bifpn_layers = nn.ModuleList([
             BiFPN(num_channels, conv_channels, epsilon, onnx_export, attention)
             for _ in range(num_layers)
         ])
-        
         self.num_layers = num_layers
+        self.output_layers = output_layers
         self.downsample = MaxPool2dDynamicSamePadding(3, 2)
         self.upsample = DySample(in_channels=num_channels, scale=2, groups=num_channels)
 
     def forward(self, inputs):
-        """
-        前向传播，将输入依次通过多个BiFPN层
-
-        Args:
-            inputs: 包含多尺度特征图的元组或列表
-                   通常为 (P1, P2, P3, P4, P5)
-
-        Returns:
-            tuple: 经过多层BiFPN顺序处理后的多尺度特征图
-        """
-        # 第一层处理原始输入
+        """前向传播，依次通过多层BiFPN，输出指定层的特征。"""
         x = self.bifpn_layers[0](inputs)
-        
-        # 后续层接收前一层的输出作为输入
         for i in range(1, self.num_layers):
-            # 更新first_time标志，确保后续层不需要再做通道转换
-            if hasattr(self.bifpn_layers[i], 'first_time'):
+            if hasattr(self.bifpn_layers[i], "first_time"):
                 self.bifpn_layers[i].first_time = False
             x = self.bifpn_layers[i](x)
-        
-        out1 = self.downsample(x[0]) + x[1]
-        out2 = self.upsample(x[3]) + x[2]
-        out3 = x[4]
 
-        return out1, out2, out3
+        if self.output_layers is None:
+            # 默认：5→3 层融合输出，兼容 CEASC (P3/P4/P5 三个尺度)
+            out1 = self.downsample(x[0]) + x[1]
+            out2 = self.upsample(x[3]) + x[2]
+            out3 = x[4]
+            return out1, out2, out3
+        return tuple(x[i] for i in self.output_layers)

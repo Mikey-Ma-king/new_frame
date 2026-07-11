@@ -1,0 +1,5 @@
+# ninja log v7
+1	9379	7935587055073106	D:/new_frame/Sparse_conv/build/temp.win-amd64-cpython-38/Release/sparse_conv_cuda.obj	32645f757e3e5d2e
+1	9280	7935592080785080	D:/new_frame/Sparse_conv/build/temp.win-amd64-cpython-38/Release/sparse_conv_cuda.obj	32645f757e3e5d2e
+1	8984	7935600565647483	D:/new_frame/Sparse_conv/build/temp.win-amd64-cpython-38/Release/sparse_conv_cuda.obj	32645f757e3e5d2e
+9	16727	7935600565727449	D:/new_frame/Sparse_conv/build/temp.win-amd64-cpython-38/Release/sparse_conv_cuda_kernel.obj	e48e869629919aea

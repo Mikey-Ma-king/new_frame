@@ -8,3 +8,5 @@ runs/
 *.pt
 *.pth
 .vscode/
+CLAUDE.md
+train_analysis.ipynb
